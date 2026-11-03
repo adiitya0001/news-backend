@@ -1,60 +1,94 @@
-import os
-from concurrent.futures import ThreadPoolExecutor
+import re
+from collections import Counter
 
-from dotenv import load_dotenv
+STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been",
+    "to", "of", "in", "on", "for", "and", "or", "but", "with",
+    "as", "at", "by", "from", "that", "this", "it", "its",
+    "has", "have", "had", "will", "would", "could", "should",
+    "after", "before", "about", "into", "over", "under",
+    "their", "they", "them", "he", "she", "his", "her",
+    "who", "what", "when", "where", "which", "while",
+}
 
-load_dotenv()
 
-try:
-    import anthropic
-except ImportError:
-    anthropic = None
+def tokenize(text):
+    words = re.findall(r"\b[a-zA-Z]{3,}\b", text.lower())
+    return [word for word in words if word not in STOPWORDS]
 
-API_KEY = os.getenv("ANTHROPIC_API_KEY")
-MODEL = "claude-haiku-5-5"  # small, cheap model is plenty for blurbs
-client = anthropic.Anthropic(api_key=API_KEY) if (anthropic and API_KEY) else None
 
-_summaries: dict = {}  # link -> result, so each story is only summarized once
-
-PROMPT = """You write short news blurbs. Based only on the headline and snippet below, reply with exactly two lines:
-SUMMARY: <one or two plain sentences>
-WHY: <one sentence on why this matters>
-Do not add facts that are not in the text.
-
-Headline: {title}
-Snippet: {snippet}"""
+def split_sentences(text):
+    return [
+        s.strip()
+        for s in re.split(r"(?<=[.!?])\s+", text or "")
+        if len(s.strip()) > 20
+    ]
 
 
 def summarize_one(story):
-    link = story["link"]
-    if link in _summaries:
-        return _summaries[link]
-    result = {"ai_summary": "", "why": ""}
-    if client:
-        try:
-            msg = client.messages.create(
-                model=MODEL,
-                max_tokens=200,
-                messages=[{
-                    "role": "user",
-                    "content": PROMPT.format(title=story["title"], snippet=story["summary"]),
-                }],
-            )
-            for line in msg.content[0].text.splitlines():
-                if line.startswith("SUMMARY:"):
-                    result["ai_summary"] = line[8:].strip()
-                elif line.startswith("WHY:"):
-                    result["why"] = line[4:].strip()
-        except Exception as e:
-            print("summary failed:", e)
-            return result  # don't cache failures, so it retries next time
-    _summaries[link] = result
-    return result
+    title = story.get("title", "")
+    description = story.get("summary", "")
+
+    sentences = split_sentences(description)
+
+    # Fallback when RSS description is missing
+    if not sentences:
+        summary = title
+    else:
+        words = tokenize(description)
+        frequencies = Counter(words)
+
+        title_words = set(tokenize(title))
+
+        scored = []
+
+        for index, sentence in enumerate(sentences):
+            sentence_words = tokenize(sentence)
+
+            if not sentence_words:
+                continue
+
+            score = sum(
+                frequencies[word] for word in sentence_words
+            ) / len(sentence_words)
+
+            # Give preference to sentences related to the headline
+            overlap = len(set(sentence_words) & title_words)
+
+            score += overlap * 0.5
+
+            # Slight preference for earlier sentences
+            score += 1 / (index + 1)
+
+            scored.append((score, index, sentence))
+
+        scored.sort(reverse=True)
+
+        selected = sorted(scored[:2], key=lambda x: x[1])
+
+        summary = " ".join(item[2] for item in selected)
+
+    # Basic explanation without external AI
+    keywords = tokenize(title)
+
+    if keywords:
+        topic = " ".join(keywords[:3])
+        why = (
+            f"This update may be useful for readers "
+            f"following {topic}."
+        )
+    else:
+        why = "This provides an update on the reported news."
+
+    return {
+        "ai_summary": summary,
+        "why": why
+    }
 
 
 def enrich(stories):
-    """Adds ai_summary and why to each story, in place."""
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        results = list(pool.map(summarize_one, stories))
-    for story, extra in zip(stories, results):
+    """Adds summaries and relevance explanations to stories."""
+
+    for story in stories:
+        extra = summarize_one(story)
         story.update(extra)
